@@ -74,6 +74,7 @@ class ResizePayload(BaseModel):
     image_url: str
     width: int = Field(gt=0, le=4000)
 
+
 @handler("resize_image", ResizePayload)
 async def resize_image(p: ResizePayload) -> dict:
     ...
