@@ -1,73 +1,128 @@
 # jobq
 
-A background job queue built on **PostgreSQL**, with a **FastAPI** HTTP API, an async worker,
-retries with exponential backoff, a dead-letter state, and **HMAC-signed webhooks**.
+A background job queue that runs on plain PostgreSQL. No Redis, no RabbitMQ.
 
-No Redis, no RabbitMQ: the queue is a table, and `SELECT ... FOR UPDATE SKIP LOCKED` lets any
-number of workers pull from it without handing the same job to two of them.
+You send a job over HTTP, workers pick it up, retry it if it fails, and when it's done
+your server gets a signed webhook. FastAPI for the API, asyncio for the workers.
 
-![CI](../../actions/workflows/ci.yml/badge.svg)
+## Why Postgres
 
-## What it does
+Most projects already have a Postgres and already back it up. Adding a broker means one
+more thing to deploy, monitor and keep in sync with the database. Keeping jobs in a table
+also means you can see what's going on with a normal SQL query.
+
+It won't do tens of thousands of jobs per second. For a typical product backend that's fine.
+
+## How workers share the queue
+
+Every worker runs roughly this:
+
+```sql
+UPDATE jobs SET status = 'running', attempts = attempts + 1, ...
+WHERE id = (
+  SELECT id FROM jobs
+  WHERE status = 'queued' AND run_at <= now()
+  ORDER BY run_at
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+```
+
+`SKIP LOCKED` is what makes it work. If another worker already locked a row, this one skips
+it and takes the next. No two workers get the same job, and nobody waits on anyone.
+
+There's a test that starts 8 workers on 40 jobs and checks that every job ran exactly once.
+
+## What happens to a job
 
 ```
-client ──POST /jobs──▶ API ──INSERT──▶ jobs table ◀──claim (SKIP LOCKED)── worker × N
-                                            │                                  │
-                                            │    finish job + write outbox row │
-                                            ▼    in ONE transaction  ◀─────────┘
-                                   webhook_deliveries ──signed POST──▶ your endpoint
+queued -> running -> succeeded
+             |
+             +-> failed? -> queued again later (backoff) -> ... -> dead
 ```
 
-- **Submit** a job with a type and payload. Payloads are validated against the job type's
-  schema at submit time, so bad input is a `422`, not a failure an hour later.
-- **Idempotency-Key** header: retrying the same request returns the same job (`200` plus
-  `Idempotent-Replayed: true`); reusing a key with a different body is a `409`. Safe under
-  concurrent duplicates thanks to a unique index.
-- **Workers** claim jobs with `FOR UPDATE SKIP LOCKED`, run them with a timeout, and on failure
-  reschedule with exponential backoff and full jitter. After `max_attempts` the job goes
-  **dead** and can be retried manually. Handlers can raise `PermanentError` to skip retries.
-- **Crash recovery**: a job stuck in `running` longer than the visibility timeout is returned
-  to the queue by a reaper loop.
-- **Webhooks** use the transactional outbox pattern: the delivery row is written in the same
-  transaction that finishes the job, so a webhook is never lost or sent for a job that did not
-  finish. Deliveries retry with backoff and are signed with HMAC-SHA256.
-- **Graceful shutdown**: on SIGTERM workers stop claiming and finish in-flight jobs.
-- **Ops endpoints**: `/stats` (counts by status plus age of the oldest ready job), `/health`.
+- Failed jobs are retried with exponential backoff and random jitter, so a flaky
+  dependency doesn't get hammered by all retries at once.
+- After `max_attempts` the job is marked `dead`. You can look at the error and retry it
+  by hand with `POST /jobs/{id}/retry`.
+- A handler can raise `PermanentError` when retrying won't help (bad input, a 404 upstream).
+  Then the job goes straight to `dead`.
+- Each job has a timeout.
+- If a worker crashes in the middle of a job, the job stays `running`. A small reaper loop
+  notices jobs that have been running too long and puts them back in the queue.
+- On SIGTERM the worker stops taking new jobs and finishes the ones it has.
 
-## Run it
+## Idempotency
+
+Send an `Idempotency-Key` header with `POST /jobs`. If the client retries the same request
+(timeout, flaky network), it gets the same job back with `200` and
+`Idempotent-Replayed: true` instead of creating a duplicate. Same key with a different body
+is a `409`. This holds even when the duplicates arrive at the same time, because the key has
+a unique index.
+
+## Webhooks
+
+If you pass `webhook_url`, you get a POST when the job succeeds or dies.
+
+The webhook row is written in the same transaction that finishes the job (the outbox
+pattern). So there's no case where the job finished but the webhook was lost, or a webhook
+went out for a job that didn't actually finish. A separate loop sends them and retries with
+backoff if your endpoint is down.
+
+Every request is signed:
+
+```
+X-Jobq-Timestamp: 1767225600
+X-Jobq-Signature: sha256=<hmac of "timestamp.body" with WEBHOOK_SECRET>
+```
+
+To verify on your side:
+
+```python
+from app.webhooks import verify
+
+ok = verify(secret, headers["X-Jobq-Timestamp"], raw_body, headers["X-Jobq-Signature"])
+```
+
+It uses a constant-time compare and rejects timestamps older than 5 minutes, so an old
+request can't be replayed.
+
+## Running it
 
 ```bash
-docker compose up --build        # Postgres, migrations, API on :8000, two workers
-open http://localhost:8000/docs
+docker compose up --build
 ```
+
+That starts Postgres, runs migrations, starts the API on :8000 and two workers.
 
 ```bash
 curl -X POST localhost:8000/jobs \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-1' \
   -d '{"type": "text_stats",
-       "payload": {"text": "the quick brown fox jumps over the lazy dog the end"},
+       "payload": {"text": "the quick brown fox jumps over the lazy dog"},
        "webhook_url": "https://webhook.site/your-id"}'
 
 curl localhost:8000/jobs/<id>
 ```
 
-## API
+## Endpoints
 
-| Method | Path | Description |
+| Method | Path | What |
 |---|---|---|
-| POST | `/jobs` | Submit a job (`202`); supports `Idempotency-Key`, `delay_seconds`, `max_attempts`, `webhook_url` |
-| GET | `/jobs` | List jobs, filter by `status` and `type`, paginated |
-| GET | `/jobs/{id}` | Job status, attempts, result, last error |
-| POST | `/jobs/{id}/cancel` | Cancel a job that has not started yet |
-| POST | `/jobs/{id}/retry` | Requeue a dead or cancelled job with a fresh attempt budget |
-| GET | `/jobs/{id}/deliveries` | Webhook delivery attempts for a job |
-| GET | `/job-types` | Registered job types and their JSON schemas |
-| GET | `/stats` | Queue depth by status and queue lag |
-| GET | `/health` | Liveness plus DB check |
+| POST | `/jobs` | submit a job (`202`) |
+| GET | `/jobs` | list, filter by `status` / `type` |
+| GET | `/jobs/{id}` | status, attempts, result, last error |
+| POST | `/jobs/{id}/cancel` | cancel if it hasn't started |
+| POST | `/jobs/{id}/retry` | requeue a dead or cancelled job |
+| GET | `/jobs/{id}/deliveries` | webhook attempts for a job |
+| GET | `/job-types` | available job types and their payload schemas |
+| GET | `/stats` | counts by status + how old the oldest waiting job is |
+| GET | `/health` | checks the DB too |
 
-## Job types
+## Adding a job type
 
-Handlers live in [`app/handlers.py`](app/handlers.py). Adding one is a schema plus a function:
+Job types live in [`app/handlers.py`](app/handlers.py). One schema, one function:
 
 ```python
 class ResizePayload(BaseModel):
@@ -81,35 +136,15 @@ async def resize_image(p: ResizePayload) -> dict:
     return {"url": new_url}
 ```
 
-Built-in examples: `text_stats`, `sha256` (CPU-bound, runs in a thread), `fetch_url`
-(4xx is permanent, 5xx is retried), `sleep`.
+The API checks the payload against the schema when the job is submitted, so bad input fails
+right away with `422` and not an hour later in a worker.
 
-## Verifying webhooks
+The built-in examples are `text_stats`, `sha256` (CPU-heavy, runs in a thread so it doesn't
+block the event loop), `fetch_url` (4xx is permanent, 5xx gets retried) and `sleep`.
 
-Each delivery carries `X-Jobq-Delivery`, `X-Jobq-Timestamp` and
-`X-Jobq-Signature: sha256=<hex>`, where the signature is
-`HMAC_SHA256(WEBHOOK_SECRET, "{timestamp}.{raw_body}")`.
+## Local development
 
-```python
-from app.webhooks import verify
-
-ok = verify(secret, headers["X-Jobq-Timestamp"], raw_body, headers["X-Jobq-Signature"])
-```
-
-`verify` uses a constant-time comparison and rejects timestamps older than five minutes,
-which blocks replayed requests.
-
-## Why PostgreSQL instead of a broker
-
-For most products the database is already there and already backed up. Keeping jobs in it
-means enqueueing can be part of the same transaction as the business write, job state is
-queryable with SQL, and there is one fewer system to run. The trade-off is throughput: a
-dedicated broker wins at tens of thousands of jobs per second, which is past what this project
-targets.
-
-## Development
-
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/) and PostgreSQL 16.
+You need Python 3.11+, [uv](https://docs.astral.sh/uv/) and Postgres 16.
 
 ```bash
 uv sync
@@ -117,17 +152,19 @@ createdb jobq_test
 DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/jobq_test uv run pytest
 uv run ruff check . && uv run ruff format --check .
 
-# run locally
 uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
 uv run python -m app.worker
 ```
 
-The test suite covers retries, backoff, dead-lettering, timeouts, crash recovery, concurrent
-idempotent submits, signed webhook delivery and retry, and a race where eight workers drain
-40 jobs and every job must run exactly once.
+Tests cover retries, backoff, dead jobs, timeouts, crash recovery, concurrent duplicate
+submits, webhook signing and retries, and the 8-workers-40-jobs race.
 
-## Configuration
+Settings are env variables, see [`.env.example`](.env.example).
 
-All settings come from environment variables; see [`.env.example`](.env.example) and
-[`app/config.py`](app/config.py).
+## What I'd add next
+
+- Priorities and separate named queues
+- Scheduled / cron jobs
+- Prometheus metrics instead of the `/stats` endpoint
+- `LISTEN/NOTIFY` so idle workers wake up instantly instead of polling
